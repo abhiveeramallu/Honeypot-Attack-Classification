@@ -1,0 +1,65 @@
+#cloud-config
+# Cowrie honeypot bootstrap for Ubuntu 22.04 LTS
+# Deploy this as user-data when creating the droplet/instance.
+# Assumes the instance sits in an isolated VPC/VLAN with no route to
+# internal/production networks (enforce that at the cloud firewall/VPC layer,
+# not just here).
+
+hostname: cowrie-hp01
+package_update: true
+package_upgrade: true
+
+users:
+  - name: cowrie
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    lock_passwd: true
+    ssh_authorized_keys:
+      - REPLACE_WITH_YOUR_ADMIN_PUBLIC_KEY
+
+packages:
+  - git
+  - python3-venv
+  - python3-pip
+  - libssl-dev
+  - libffi-dev
+  - build-essential
+  - libpython3-dev
+  - python3-minimal
+  - authbind
+  - virtualenv
+  - fail2ban
+  - iptables-persistent
+  - unattended-upgrades
+  - ufw
+
+write_files:
+  # Move real admin SSH off port 22 BEFORE Cowrie ever binds anything there.
+  - path: /etc/ssh/sshd_config.d/99-hardening.conf
+    content: |
+      Port 22222
+      PermitRootLogin no
+      PasswordAuthentication no
+      X11Forwarding no
+      AllowUsers cowrie
+    owner: root:root
+    permissions: "0644"
+
+runcmd:
+  # --- SSH hardening: admin access moves to 22222 ---
+  - systemctl restart ssh
+
+  # --- Base firewall: default deny, allow admin SSH + honeypot ports only ---
+  - ufw default deny incoming
+  - ufw default allow outgoing   # tightened further by egress-restrict.sh below
+  - ufw allow 22222/tcp          # real admin SSH
+  - ufw allow 22/tcp             # forwarded to Cowrie (see iptables-nat.sh)
+  - ufw allow 23/tcp             # forwarded to Cowrie telnet
+  - ufw --force enable
+
+  # --- Fetch and run the Cowrie install + egress-restriction scripts ---
+  - mkdir -p /opt/provision
+  - echo "Provisioning host ready. Run setup_cowrie.sh and egress-restrict.sh as the cowrie user."
+
+final_message: "Cowrie host base image ready after $UPTIME seconds. Next: run infra/setup_cowrie.sh as the cowrie user, then infra/iptables-nat.sh and infra/egress-restrict.sh as root."

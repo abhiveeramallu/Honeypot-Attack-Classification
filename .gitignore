@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+data/sqlite/*.db
+data/parquet/*.parquet
+data/*.csv
+data/model.joblib
+detection/sigma_rules/*.yml
+.streamlit/
