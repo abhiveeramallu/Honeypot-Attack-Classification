@@ -1,0 +1,47 @@
+# Alternative to rsync_pull_logs.sh: real-time log shipping via Filebeat
+# instead of polling. Install Filebeat ON THE HONEYPOT and point it at a
+# Logstash/Elasticsearch endpoint on the processing server (or write straight
+# to a file the ETL polls, via the `file` output below).
+#
+# Trade-off vs. the rsync approach: Filebeat needs outbound network access
+# from the honeypot to the processing server, which cuts against the
+# egress-restrict.sh default-deny posture (infra/egress-restrict.sh) — if you
+# use this, add an explicit egress allow rule for the processing server's IP
+# only, in place of enabling broad outbound plus DNS/NTP/HTTP(S). The rsync
+# pull approach (rsync_pull_logs.sh) needs no such honeypot-side egress
+# change since the processing server initiates the connection.
+
+filebeat.inputs:
+  - type: log
+    enabled: true
+    paths:
+      - /home/cowrie/cowrie/var/log/cowrie/cowrie.json
+    json.keys_under_root: true
+    json.add_error_key: true
+    fields:
+      log_type: cowrie
+    fields_under_root: true
+
+# Option A: ship straight to Logstash for further pipeline integration.
+output.logstash:
+  hosts: ["processing-server.internal:5044"]
+  ssl.certificate_authorities: ["/etc/filebeat/ca.pem"]
+  ssl.certificate: "/etc/filebeat/filebeat.crt"
+  ssl.key: "/etc/filebeat/filebeat.key"
+
+# Option B (simpler, no ELK stack): ship to a local file that a cron job or
+# systemd path unit on the processing server then feeds into
+# etl/etl_parser.py, mirroring what rsync_pull_logs.sh delivers. Comment out
+# output.logstash above and uncomment this if you go this route:
+# output.file:
+#   path: "/var/lib/filebeat/cowrie_shipped"
+#   filename: cowrie.json
+#   rotate_every_kb: 10240
+#   number_of_files: 20
+
+logging.level: info
+logging.to_files: true
+logging.files:
+  path: /var/log/filebeat
+  name: filebeat
+  keepfiles: 7

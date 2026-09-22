@@ -1,0 +1,24 @@
+# Runs the full ETL -> classification -> Sigma/IoC pipeline over whatever
+# logs have landed locally. Pair with honeypot-pipeline.timer, offset a few
+# minutes after cowrie-log-sync.timer so fresh logs are usually there first
+# (a stale run just reprocesses the same data — etl_parser's session merge
+# is idempotent — so exact ordering isn't load-bearing).
+[Unit]
+Description=Run the honeypot ATT&CK classification pipeline
+After=network.target
+
+[Service]
+Type=oneshot
+User=honeypot-pipeline
+WorkingDirectory=/opt/honeypot-pipeline
+# --raw-logs points at ONE honeypot's synced log dir (etl_parser.py globs
+# *.json* non-recursively, so for a multi-host fleet run one pipeline
+# invocation per host directory, e.g. data/raw_logs/<hostname>/, or merge
+# them into a single flat directory before this step).
+ExecStart=/opt/honeypot-pipeline/.venv/bin/python run_pipeline.py \
+  --raw-logs /opt/honeypot-pipeline/data/raw_logs/cowrie-hp01.internal \
+  --db /opt/honeypot-pipeline/data/sqlite/sessions.db \
+  --parquet /opt/honeypot-pipeline/data/parquet/sessions.parquet \
+  --model-dir /opt/honeypot-pipeline/models \
+  --sigma-out-dir /opt/honeypot-pipeline/detection/sigma_rules \
+  --ioc-out-csv /opt/honeypot-pipeline/data/ioc_feed.csv

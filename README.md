@@ -6,59 +6,86 @@ MITRE ATT&CK auto-tagging -> Streamlit dashboard -> Sigma/IoC detection output.
 ## Layout
 
 ```
-infra/          Cloud-init + hardening scripts to deploy Cowrie on a VPS
-etl/            etl_parser.py — cowrie.json -> SQLite/Parquet sessions
-features/       attack_rules.py, rule_classifier.py, feature_extractor.py
-ml/             labeling_schema.py, ml_classifier.py
-dashboard/      app.py — Streamlit multi-page analytics UI
-detection/      generate_sigma.py — Sigma rules + IoC feed
-data/           sample_cowrie_logs (synthetic), sqlite/, parquet/ outputs
+run_pipeline.py     Orchestrates the full ETL -> classify -> Sigma/IoC run
+infra/               Cloud-init + hardening scripts to deploy Cowrie on a VPS
+infra/log_shipping/  rsync-over-SSH + systemd timers (+ Filebeat alt.) to
+                     ship logs from the honeypot to the processing server
+etl/                 etl_parser.py — cowrie.json -> SQLite/Parquet sessions
+features/            attack_rules.py, rule_classifier.py, feature_extractor.py
+ml/                  labeling_schema.py, train_pipeline.py, ml_classifier.py
+dashboard/           app.py — Streamlit multi-page analytics UI
+detection/           generate_sigma.py — Sigma rules + IoC feed
+tests/               pytest suite (etl / rule engine / ML fallback)
+data/                sample_cowrie_logs (synthetic), sqlite/, parquet/ outputs
+models/              trained model.joblib + vectorizer.joblib + feature_meta.joblib
 ```
 
 ## Quickstart (local, using the bundled synthetic sample logs)
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # requirements.txt + pytest
 
-# Phase 2: ETL
-python etl/etl_parser.py \
-  --input data/sample_cowrie_logs \
-  --out-db data/sqlite/sessions.db \
-  --out-parquet data/parquet/sessions.parquet
+# Run the tests
+python -m pytest tests/ -v
 
-# Phase 3: rule engine (writes rule_techniques column back into the DB)
-cd features && python rule_classifier.py --db ../data/sqlite/sessions.db && cd ..
+# Bootstrap a model from the rule engine's own output (see "Ground truth
+# and training" below for why this is a smoke-test model, not a trustworthy
+# one, until real sessions get human-reviewed labels).
+cd ml && python train_pipeline.py \
+  --raw-logs ../data/sample_cowrie_logs \
+  --model-dir ../models \
+  --folds 3 && cd ..
 
-# Phase 3: feature matrix (TF-IDF + boolean flags + session metrics)
-cd features && python feature_extractor.py \
-  --db ../data/sqlite/sessions.db \
-  --out-parquet ../data/parquet/features.parquet && cd ..
+# One-shot: parse raw logs -> rule engine -> ML (with rule fallback) ->
+# SQLite/Parquet -> Sigma rules + IoC feed.
+python run_pipeline.py \
+  --raw-logs data/sample_cowrie_logs \
+  --db data/sqlite/sessions.db \
+  --parquet data/parquet/sessions.parquet \
+  --model-dir models \
+  --sigma-out-dir detection/sigma_rules \
+  --ioc-out-csv data/ioc_feed.csv
+# (--skip-ml, or simply an empty/missing --model-dir, runs rule-engine-only)
 
-# Phase 4: export sessions for human labeling, then fill in confirmed_techniques
-cd ml && python labeling_schema.py \
-  --db ../data/sqlite/sessions.db \
-  --out-csv ../data/labels_for_annotation.csv && cd ..
-# (edit data/labels_for_annotation.csv by hand, or import into Label Studio)
-
-# Phase 4: train + evaluate
-cd ml && python ml_classifier.py train \
-  --features ../data/parquet/features.parquet \
-  --labels ../data/labels_for_annotation.csv \
-  --model-type rf \
-  --model-out ../data/model.joblib && cd ..
-
-# Phase 5: dashboard
+# Dashboard
 cd dashboard && streamlit run app.py -- --db ../data/sqlite/sessions.db && cd ..
-
-# Phase 6: Sigma rules + IoC feed from the rule engine's output
-cd detection && python generate_sigma.py \
-  --db ../data/sqlite/sessions.db \
-  --technique-col rule_techniques \
-  --min-sessions 1 \
-  --sigma-out-dir sigma_rules \
-  --ioc-out-csv ../data/ioc_feed.csv && cd ..
 ```
+
+`run_pipeline.py` is idempotent — `etl_parser.py`'s session merge means
+re-running it over the same (or overlapping) raw logs just reprocesses the
+same sessions, so it's safe to schedule on a timer (see log shipping below)
+without deduping logs yourself first.
+
+## Ground truth and training (Phase 4)
+
+`ml/train_pipeline.py` builds its training labels by running the Phase 3
+rule engine over parsed sessions — this is a **bootstrap label**, not a
+human-verified one. A model trained only on bootstrap labels has learned to
+reproduce the rule engine's own regexes, not to generalize past them; it
+will not catch anything the rules don't already catch. Treat a
+rule-engine-bootstrapped model as a pipeline smoke test.
+
+To get a model that's actually worth trusting:
+
+1. `cd ml && python labeling_schema.py --db ../data/sqlite/sessions.db --out-csv ../data/labels_for_annotation.csv`
+2. Have a human fill in (or correct) the `confirmed_techniques` column —
+   directly in the CSV, or via a Label Studio import/export round-trip.
+3. `python train_pipeline.py --db ../data/sqlite/sessions.db --labels-csv ../data/labels_for_annotation.csv --model-dir ../models`
+   — sessions present in the labels CSV with a non-blank
+   `confirmed_techniques` override the rule-engine bootstrap; sessions not
+   yet reviewed keep the bootstrap label rather than being silently wiped.
+
+`train_pipeline.py` reports K-Fold cross-validated precision/recall/F1 per
+ATT&CK technique (folds auto-shrink for tiny datasets, with a warning) and
+serializes `model.joblib`, `vectorizer.joblib`, and `feature_meta.joblib` to
+`--model-dir`. `ml/ml_classifier.py` loads that exact fitted TF-IDF
+vectorizer at inference time — inference features are computed in the same
+column space training used, rather than each run re-fitting its own
+vectorizer on whatever's on hand (a real train/inference skew that existed
+before `train_pipeline.py` was split out — see git history if curious).
+`predict_with_fallback()` falls back to the rule engine per-session when the
+model's max predicted probability is below `--threshold` (default 0.70).
 
 ## Deploying the real honeypot (Phase 1)
 
@@ -75,21 +102,40 @@ cd detection && python generate_sigma.py \
    `infra/egress-restrict.sh` (default-deny outbound except DNS/NTP/HTTP/S —
    stops the box being usable for outbound DDoS or lateral pivoting even if
    an attacker gets a real shell).
-5. Pull `var/log/cowrie/cowrie.json` and `var/lib/cowrie/downloads/` down to
-   wherever you run the ETL pipeline (rsync/scp over the admin port, not
-   through the honeypot).
+
+## Automated log shipping (Phase 1)
+
+`infra/log_shipping/` has two options to get `cowrie.json` + captured
+payloads from the honeypot to wherever `run_pipeline.py` runs:
+
+- **rsync over SSH (default, recommended)** — `rsync_pull_logs.sh` runs ON
+  THE PROCESSING SERVER and *pulls* from the honeypot, using a key
+  restricted on the honeypot side to read-only rsync of Cowrie's `var/`
+  directory (`honeypot_authorized_keys_snippet.txt` — via `rrsync`, no
+  shell, no port/agent/X11 forwarding). Pull-based means a compromised
+  honeypot never holds credentials that can write to the processing server.
+  `cowrie-log-sync.{service,timer}` runs it every 5 minutes via systemd;
+  `honeypot-pipeline.{service,timer}` runs `run_pipeline.py` itself every 10
+  minutes after that. Install both pairs under `/etc/systemd/system/` on the
+  processing server and `systemctl enable --now` the timers.
+- **Filebeat (alternative, real-time)** — `filebeat-cowrie.yml`, installed
+  ON THE HONEYPOT, ships events as they're written instead of polling. This
+  needs *outbound* network access from the honeypot to the processing
+  server, which means carving an explicit exception into
+  `egress-restrict.sh`'s default-deny — noted inline in the config.
 
 ## Notes
 
-- The rule engine (`features/attack_rules.py`) is the ground truth used to
-  bootstrap labels — start there, confirm/correct with a human via
-  `ml/labeling_schema.py`, then train the ML classifier on the confirmed
-  labels. The ML classifier falls back to the rule engine per-session when
-  its confidence is below `--threshold` (default 0.70).
 - `data/sample_cowrie_logs/cowrie.json` is synthetic data for pipeline
   development/testing — replace with real captures before drawing
   conclusions from the dashboard or shipping Sigma rules.
 - Sigma rules in `detection/generate_sigma.py` are `status: experimental` —
   tune false-positive scope (especially around `wget`/`curl`/`chmod`, which
   are common in legitimate sysadmin activity) before deploying to a
-  production SIEM.
+  production SIEM. `run_pipeline.py --min-sessions` controls how many
+  independent sessions must show a pattern before a rule is emitted at all.
+- The dashboard (`dashboard/app.py`) reads directly from the SQLite sessions
+  table, cached for 60s (or refreshed immediately via the sidebar button),
+  so it picks up whatever `run_pipeline.py` last wrote — including
+  `predicted_techniques`/`confidence`/`source` when a model was used, or
+  `rule_techniques` alone in rule-only mode.

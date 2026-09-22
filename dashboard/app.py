@@ -25,7 +25,7 @@ from attack_rules import technique_lookup  # noqa: E402
 st.set_page_config(page_title="Honeypot ATT&CK Dashboard", layout="wide")
 
 
-def _cli_db_path() -> Path:
+def _cli_db_path() -> tuple[Path, str]:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, default=Path(__file__).resolve().parent.parent / "data/sqlite/sessions.db")
     parser.add_argument("--table", default="sessions")
@@ -172,6 +172,13 @@ def page_session_explorer(df: pd.DataFrame) -> None:
         else:
             st.write("None detected.")
 
+        if "source" in row.index and pd.notna(row.get("source")):
+            source = row["source"]
+            confidence = row.get("confidence")
+            label = "ML model" if source == "ml" else "rule engine (ML confidence was below threshold)"
+            conf_str = f", confidence {float(confidence):.2f}" if pd.notna(confidence) else ""
+            st.caption(f"Classified by: {label}{conf_str}")
+
 
 def page_ioc_vault(df: pd.DataFrame) -> None:
     st.title("IoC / Payload Vault")
@@ -192,6 +199,15 @@ def page_ioc_vault(df: pd.DataFrame) -> None:
             columns={"file_hashes_list": "sha256"}), width="stretch")
     else:
         st.info("No file hashes captured yet.")
+
+    st.subheader("IoC Feed")
+    ioc_csv = Path(__file__).resolve().parent.parent / "data" / "ioc_feed.csv"
+    if ioc_csv.exists():
+        ioc_bytes = ioc_csv.read_text()
+        st.download_button("Download IoC feed (CSV)", ioc_bytes, file_name="ioc_feed.csv", key="dl_ioc_feed")
+        st.dataframe(pd.read_csv(ioc_csv), width="stretch")
+    else:
+        st.info("No IoC feed generated yet. Run detection/generate_sigma.py or run_pipeline.py.")
 
     st.subheader("Sigma Rule Drafts")
     sigma_dir = Path(__file__).resolve().parent.parent / "detection" / "sigma_rules"
@@ -221,6 +237,10 @@ def main() -> None:
         "Page", ["Executive Summary", "ATT&CK Matrix", "Session Explorer", "IoC / Payload Vault"]
     )
     st.sidebar.caption(f"Data source: {db_path}")
+    st.sidebar.caption("Auto-refreshes every 60s; click below to pick up a pipeline run immediately.")
+    if st.sidebar.button("Refresh data now"):
+        st.cache_data.clear()
+        st.rerun()
 
     if page == "Executive Summary":
         page_executive_summary(df)

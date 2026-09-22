@@ -41,10 +41,19 @@ class Session:
     file_hashes: list[str] = field(default_factory=list)
 
 
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
 def _clean_command(raw: str) -> str:
-    """Strip terminal control chars/escape sequences and surrounding noise."""
-    text = CONTROL_CHARS_RE.sub("", raw)
-    text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text)  # ANSI escape sequences
+    """Strip terminal control chars/escape sequences and surrounding noise.
+
+    ANSI sequences must be stripped *before* the general control-char sweep:
+    that sweep's range includes \\x1b (ESC, 0x1b falls in 0x0e-0x1f), so
+    running it first would delete the ESC byte out from under the ANSI
+    regex and leave the literal "[31m"-style bracket text behind.
+    """
+    text = ANSI_ESCAPE_RE.sub("", raw)
+    text = CONTROL_CHARS_RE.sub("", text)
     return text.strip()
 
 

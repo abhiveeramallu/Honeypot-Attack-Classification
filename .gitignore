@@ -5,5 +5,7 @@ data/sqlite/*.db
 data/parquet/*.parquet
 data/*.csv
 data/model.joblib
+models/*.joblib
 detection/sigma_rules/*.yml
 .streamlit/
+.pytest_cache/

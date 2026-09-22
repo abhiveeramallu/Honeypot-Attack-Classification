@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sqlite3
 from pathlib import Path
 
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
+
+logger = logging.getLogger(__name__)
 
 # Boolean "critical command" flags — cheap, interpretable signals that feed
 # both the rule engine and the ML model as extra columns.
@@ -36,6 +39,7 @@ def _load_commands(command_sequence_json: str) -> list[str]:
     try:
         return json.loads(command_sequence_json)
     except (TypeError, json.JSONDecodeError):
+        logger.warning("Could not parse command_sequence value %r as JSON; treating as empty.", command_sequence_json)
         return []
 
 
@@ -64,27 +68,43 @@ def build_session_metrics(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_tfidf_features(
-    df: pd.DataFrame, max_features: int = 300, ngram_range: tuple[int, int] = (1, 2)
+    df: pd.DataFrame,
+    vectorizer: TfidfVectorizer | None = None,
+    max_features: int = 300,
+    ngram_range: tuple[int, int] = (1, 2),
 ) -> tuple[pd.DataFrame, TfidfVectorizer]:
     """TF-IDF over whitespace-joined command sequences, with word n-grams
     (n-grams over *commands*, not characters, since a command like
-    `chmod +x` is the meaningful unit)."""
+    `chmod +x` is the meaningful unit).
+
+    Pass a `vectorizer` already fit at training time to get inference-time
+    features in the exact same column space (fitting a fresh vectorizer on
+    each call, as this function used to do unconditionally, silently
+    desynced train-time and inference-time feature columns).
+    """
     corpus = [" | ".join(_load_commands(s)) for s in df["command_sequence"]]
-    vectorizer = TfidfVectorizer(
-        max_features=max_features,
-        ngram_range=ngram_range,
-        token_pattern=r"(?u)\b\w[\w./+-]*\b",
-    )
-    matrix = vectorizer.fit_transform(corpus)
+
+    if vectorizer is None:
+        vectorizer = TfidfVectorizer(
+            max_features=max_features,
+            ngram_range=ngram_range,
+            token_pattern=r"(?u)\b\w[\w./+-]*\b",
+        )
+        matrix = vectorizer.fit_transform(corpus)
+    else:
+        matrix = vectorizer.transform(corpus)
+
     feature_names = [f"tfidf_{t}" for t in vectorizer.get_feature_names_out()]
     tfidf_df = pd.DataFrame(matrix.toarray(), columns=feature_names, index=df.index)
     return tfidf_df, vectorizer
 
 
-def build_feature_matrix(df: pd.DataFrame, max_features: int = 300) -> tuple[pd.DataFrame, TfidfVectorizer]:
+def build_feature_matrix(
+    df: pd.DataFrame, vectorizer: TfidfVectorizer | None = None, max_features: int = 300
+) -> tuple[pd.DataFrame, TfidfVectorizer]:
     flags = build_boolean_flags(df)
     metrics = build_session_metrics(df)
-    tfidf_df, vectorizer = build_tfidf_features(df, max_features=max_features)
+    tfidf_df, vectorizer = build_tfidf_features(df, vectorizer=vectorizer, max_features=max_features)
 
     features = pd.concat(
         [df[["session_id"]].reset_index(drop=True),
@@ -94,6 +114,13 @@ def build_feature_matrix(df: pd.DataFrame, max_features: int = 300) -> tuple[pd.
         axis=1,
     )
     return features, vectorizer
+
+
+FLAG_COLUMNS = list(CRITICAL_PATTERNS.keys())
+METRIC_COLUMNS = [
+    "command_count", "session_duration", "avg_seconds_between_commands", "login_attempts",
+    "login_success", "url_count",
+]
 
 
 def main() -> None:

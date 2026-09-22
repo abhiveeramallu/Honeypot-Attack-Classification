@@ -1,0 +1,15 @@
+# Add this line to ~cowrie/.ssh/authorized_keys ON THE HONEYPOT (not the
+# processing server), using the PUBLIC half of the key generated for
+# rsync_pull_logs.sh (SSH_KEY there). It restricts that key to read-only
+# rsync of the log/downloads directories, with no shell, no port forwarding,
+# and no agent/X11 forwarding — so a leaked or brute-forced copy of this key
+# still can't be used to get a shell on the honeypot or pivot through it.
+#
+# `rrsync` ships with the rsync package (usually at
+# /usr/share/doc/rsync/scripts/rrsync or /usr/lib/rsync/rrsync — check your
+# distro) and only allows the rsync protocol, nothing else. It takes a
+# single directory argument, so this grants read-only access to Cowrie's
+# whole var/ tree (logs + downloads + local state, no secrets) rather than
+# trying to whitelist the two subdirectories separately.
+
+command="/usr/share/rsync/scripts/rrsync -ro /home/cowrie/cowrie/var/",no-agent-forwarding,no-X11-forwarding,no-port-forwarding,no-pty ssh-ed25519 AAAA...REPLACE_WITH_PUBLIC_KEY... log-puller@processing-server
